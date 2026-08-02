@@ -12,6 +12,7 @@ using SPTarkov.Server.Core.Models.Spt.Mod;
 using SPTarkov.Server.Core.Models.Utils;
 using SPTarkov.Server.Core.Servers;
 using SPTarkov.Server.Core.Services;
+using SPTarkov.Server.Core.Utils.Cloners;
 using Path = System.IO.Path;
 
 namespace InsuranceControl;
@@ -22,7 +23,7 @@ public record ModMetadata : AbstractModMetadata
     public override string Name { get; init; } = "Insurance Refund";
     public override string Author { get; init; } = "gadjed";
     public override List<string>? Contributors { get; init; } = null;
-    public override SemanticVersioning.Version Version { get; init; } = new("1.0.1");
+    public override SemanticVersioning.Version Version { get; init; } = new("1.0.2");
     public override SemanticVersioning.Range SptVersion { get; init; } = new("~4.0.0");
     public override List<string>? Incompatibilities { get; init; } = null;
     public override Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; } = null;
@@ -38,11 +39,16 @@ public class InsuranceControlMod(
     ConfigServer configServer,
     DatabaseService databaseService,
     ItemHelper itemHelper,
+    ProfileHelper profileHelper,
+    ICloner cloner,
     PatchManager patchManager
 ) : IOnLoad
 {
     public static ModConfig Config { get; private set; } = new();
     public static ItemHelper ItemHelper { get; private set; } = null!;
+    public static ProfileHelper ProfileHelper { get; private set; } = null!;
+    public static ICloner Cloner { get; private set; } = null!;
+    public static ISptLogger<InsuranceControlMod>? Logger { get; private set; }
 
     private static readonly Dictionary<string, MongoId> TraderIds = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -55,6 +61,9 @@ public class InsuranceControlMod(
     public Task OnLoad()
     {
         ItemHelper = itemHelper;
+        ProfileHelper = profileHelper;
+        Cloner = cloner;
+        Logger = logger;
 
         var pathToMod = modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly());
         var configPath = Path.Combine(pathToMod, "config.json");
@@ -66,9 +75,14 @@ public class InsuranceControlMod(
         ApplyTraderReturnHours();
         EnableContentPatches();
 
+        var effectiveReturn = Config.DebugReturnSeconds > 0
+            ? Config.DebugReturnSeconds
+            : Config.ReturnTimeOverrideSeconds;
+
         logger.Success(
-            $"[InsuranceControl] Loaded. ReturnTimeOverride={Config.ReturnTimeOverrideSeconds}s, "
-                + $"MagsWithAmmo={Config.ReturnMagazinesWithAmmo}, "
+            $"[InsuranceControl] Loaded v1.0.2. Return={effectiveReturn}s"
+                + (Config.DebugReturnSeconds > 0 ? " (DEBUG)" : "")
+                + $", MagsWithAmmo={Config.ReturnMagazinesWithAmmo}, "
                 + $"ContainersWithContents={Config.ReturnContainersWithContents}."
         );
 
@@ -77,11 +91,24 @@ public class InsuranceControlMod(
 
     private void ApplyInsuranceConfig(InsuranceConfig insurance)
     {
-        insurance.ReturnTimeOverrideSeconds = Math.Max(0, Config.ReturnTimeOverrideSeconds);
+        var debugReturn = Config.DebugReturnSeconds > 0;
+        var returnSeconds = debugReturn ? Config.DebugReturnSeconds : Config.ReturnTimeOverrideSeconds;
+        insurance.ReturnTimeOverrideSeconds = Math.Max(0, returnSeconds);
         insurance.StorageTimeOverrideSeconds = Math.Max(0, Config.StorageTimeOverrideSeconds);
         insurance.SimulateItemsBeingTaken = Config.SimulateItemsBeingTaken;
 
-        if (Config.RunIntervalSeconds > 0)
+        if (debugReturn)
+        {
+            // Poll often enough that a 60s debug return is not delayed by the interval.
+            var poll = Config.RunIntervalSeconds > 0 ? Config.RunIntervalSeconds : 60;
+            insurance.RunIntervalSeconds = Math.Min(poll, Math.Max(5, Config.DebugReturnSeconds / 3));
+            logger.LogWithColor(
+                $"[InsuranceControl] DEBUG fast return enabled: {Config.DebugReturnSeconds}s "
+                    + $"(poll every {insurance.RunIntervalSeconds}s).",
+                LogTextColor.Yellow
+            );
+        }
+        else if (Config.RunIntervalSeconds > 0)
         {
             insurance.RunIntervalSeconds = Config.RunIntervalSeconds;
         }
@@ -107,12 +134,16 @@ public class InsuranceControlMod(
 
     private void ApplyTraderReturnHours()
     {
-        if (Config.ReturnTimeOverrideSeconds > 0)
+        if (Config.DebugReturnSeconds > 0 || Config.ReturnTimeOverrideSeconds > 0)
         {
-            logger.LogWithColor(
-                $"[InsuranceControl] Using ReturnTimeOverrideSeconds={Config.ReturnTimeOverrideSeconds}; TraderReturnHours ignored.",
-                LogTextColor.Cyan
-            );
+            if (Config.DebugReturnSeconds <= 0)
+            {
+                logger.LogWithColor(
+                    $"[InsuranceControl] Using ReturnTimeOverrideSeconds={Config.ReturnTimeOverrideSeconds}; TraderReturnHours ignored.",
+                    LogTextColor.Cyan
+                );
+            }
+
             return;
         }
 
@@ -145,15 +176,20 @@ public class InsuranceControlMod(
 
     private void EnableContentPatches()
     {
-        if (!Config.ReturnMagazinesWithAmmo && !Config.ReturnContainersWithContents)
+        var needEnrichment = Config.ReturnMagazinesWithAmmo || Config.ReturnContainersWithContents;
+        if (!needEnrichment)
         {
             return;
         }
 
         patchManager.PatcherName = "InsuranceControl";
+        patchManager.AddPatch(new SnapshotRaidInventoryPatch());
         patchManager.AddPatch(new EnrichLostInsuredItemsPatch());
         patchManager.EnablePatches();
-        logger.LogWithColor("[InsuranceControl] Content enrichment patch enabled.", LogTextColor.Cyan);
+        logger.LogWithColor(
+            "[InsuranceControl] Content enrichment + pre-raid snapshot patches enabled.",
+            LogTextColor.Cyan
+        );
     }
 
     private static bool TryResolveTraderId(string key, out MongoId traderId)
